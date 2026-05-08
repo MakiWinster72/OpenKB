@@ -7,6 +7,7 @@ Pipeline leveraging LLM prompt caching:
   Step 4: Concurrent LLM calls (A cached) → generate new + rewrite updated concepts.
   Step 5: Code adds cross-ref links to related concepts, updates index.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -64,11 +65,11 @@ Existing concept pages:
 Return a JSON object with three keys:
 
 1. "create" — new concepts not covered by any existing page. Array of objects:
-   {{"name": "concept-slug", "title": "Human-Readable Title"}}
+   {{"name": "concept-name", "title": "Human-Readable Title"}}
 
 2. "update" — existing concepts that have significant new information from \
 this document worth integrating. Array of objects:
-   {{"name": "existing-slug", "title": "Existing Title"}}
+   {{"name": "existing-name", "title": "Existing Title"}}
 
 3. "related" — existing concepts tangentially related to this document but \
 not needing content changes, just a cross-reference link. Array of slug strings.
@@ -78,6 +79,8 @@ Rules:
 - Do NOT create a concept that overlaps with an existing one — use "update".
 - Do NOT create concepts that are just the document topic itself.
 - "related" is for lightweight cross-linking only, no content rewrite needed.
+- Keep Unicode characters (Chinese, Japanese, etc.) in the "name" field as-is.
+  Only use ASCII slugs for alphabet-based scripts.
 
 Return ONLY valid JSON, no fences, no explanation.
 """
@@ -130,6 +133,7 @@ Return ONLY the Markdown content (no frontmatter, no code fences).
 # ---------------------------------------------------------------------------
 # LLM helpers
 # ---------------------------------------------------------------------------
+
 
 class _Spinner:
     """Animated dots spinner that runs in a background thread."""
@@ -195,7 +199,11 @@ def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str
     content = response.choices[0].message.content or ""
 
     spinner.stop(_format_usage(time.time() - t0, response.usage))
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    logger.debug(
+        "LLM response [%s]:\n%s",
+        step_name,
+        content[:500] + ("..." if len(content) > 500 else ""),
+    )
     return content.strip()
 
 
@@ -211,17 +219,22 @@ async def _llm_call_async(model: str, messages: list[dict], step_name: str) -> s
     elapsed = time.time() - t0
     sys.stdout.write(f"    {step_name}... {_format_usage(elapsed, response.usage)}\n")
     sys.stdout.flush()
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    logger.debug(
+        "LLM response [%s]:\n%s",
+        step_name,
+        content[:500] + ("..." if len(content) > 500 else ""),
+    )
     return content.strip()
 
 
 def _parse_json(text: str) -> list | dict:
     """Parse JSON from LLM response, handling fences, prose, and malformed JSON."""
     from json_repair import repair_json
+
     cleaned = text.strip()
     if cleaned.startswith("```"):
         first_nl = cleaned.find("\n")
-        cleaned = cleaned[first_nl + 1:] if first_nl != -1 else cleaned[3:]
+        cleaned = cleaned[first_nl + 1 :] if first_nl != -1 else cleaned[3:]
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
     result = json.loads(repair_json(cleaned.strip()))
@@ -234,13 +247,20 @@ def _parse_json(text: str) -> list | dict:
 # File I/O helpers
 # ---------------------------------------------------------------------------
 
+
 def _read_wiki_context(wiki_dir: Path) -> tuple[str, list[str]]:
     """Read current index.md content and list of existing concept slugs."""
     index_path = wiki_dir / "index.md"
-    index_content = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+    index_content = (
+        index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+    )
 
     concepts_dir = wiki_dir / "concepts"
-    existing = sorted(p.stem for p in concepts_dir.glob("*.md")) if concepts_dir.exists() else []
+    existing = (
+        sorted(p.stem for p in concepts_dir.glob("*.md"))
+        if concepts_dir.exists()
+        else []
+    )
 
     return index_content, existing
 
@@ -270,11 +290,11 @@ def _read_concept_briefs(wiki_dir: Path) -> str:
         if text.startswith("---"):
             end = text.find("---", 3)
             if end != -1:
-                fm = text[:end + 3]
-                body = text[end + 3:]
+                fm = text[: end + 3]
+                body = text[end + 3 :]
                 for line in fm.split("\n"):
                     if line.startswith("brief:"):
-                        brief = line[len("brief:"):].strip()
+                        brief = line[len("brief:") :].strip()
                         break
         if not brief:
             brief = body.strip().replace("\n", " ")[:150]
@@ -309,7 +329,9 @@ def _section_contains_link(lines: list[str], heading: str, link: str) -> bool:
     return any(line.startswith(entry_prefix) for line in lines[start:end])
 
 
-def _replace_section_entry(lines: list[str], heading: str, link: str, entry: str) -> bool:
+def _replace_section_entry(
+    lines: list[str], heading: str, link: str, entry: str
+) -> bool:
     """Replace the first matching entry within a specific section."""
     bounds = _get_section_bounds(lines, heading)
     if bounds is None:
@@ -335,14 +357,14 @@ def _insert_section_entry(lines: list[str], heading: str, entry: str) -> bool:
     return True
 
 
-
-def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
-                    doc_type: str = "short") -> None:
+def _write_summary(
+    wiki_dir: Path, doc_name: str, summary: str, doc_type: str = "short"
+) -> None:
     """Write summary page with frontmatter."""
     if summary.startswith("---"):
         end = summary.find("---", 3)
         if end != -1:
-            summary = summary[end + 3:].lstrip("\n")
+            summary = summary[end + 3 :].lstrip("\n")
     summaries_dir = wiki_dir / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     ext = "md" if doc_type == "short" else "json"
@@ -351,10 +373,12 @@ def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
         f"full_text: sources/{doc_name}.{ext}",
     ]
     frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-    (summaries_dir / f"{doc_name}.md").write_text(frontmatter + summary, encoding="utf-8")
+    (summaries_dir / f"{doc_name}.md").write_text(
+        frontmatter + summary, encoding="utf-8"
+    )
 
 
-_SAFE_NAME_RE = re.compile(r'[^\w\-]')
+_SAFE_NAME_RE = re.compile(r"[^\w\-]")
 
 
 def _sanitize_concept_name(name: str) -> str:
@@ -364,7 +388,14 @@ def _sanitize_concept_name(name: str) -> str:
     return sanitized or "unnamed-concept"
 
 
-def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "") -> None:
+def _write_concept(
+    wiki_dir: Path,
+    name: str,
+    content: str,
+    source_file: str,
+    is_update: bool,
+    brief: str = "",
+) -> None:
     """Write or update a concept page, managing the sources frontmatter."""
     concepts_dir = wiki_dir / "concepts"
     concepts_dir.mkdir(parents=True, exist_ok=True)
@@ -380,8 +411,8 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
             if existing.startswith("---"):
                 end = existing.find("---", 3)
                 if end != -1:
-                    fm = existing[:end + 3]
-                    body = existing[end + 3:]
+                    fm = existing[: end + 3]
+                    body = existing[end + 3 :]
                     if "sources:" in fm:
                         fm = fm.replace("sources: [", f"sources: [{source_file}, ")
                     else:
@@ -394,12 +425,12 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if clean.startswith("---"):
             end = clean.find("---", 3)
             if end != -1:
-                clean = clean[end + 3:].lstrip("\n")
+                clean = clean[end + 3 :].lstrip("\n")
         # Replace body with LLM rewrite (prompt asks for full rewrite, not delta)
         if existing.startswith("---"):
             end = existing.find("---", 3)
             if end != -1:
-                existing = existing[:end + 3] + "\n\n" + clean
+                existing = existing[: end + 3] + "\n\n" + clean
             else:
                 existing = clean
         else:
@@ -407,8 +438,8 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if brief and existing.startswith("---"):
             end = existing.find("---", 3)
             if end != -1:
-                fm = existing[:end + 3]
-                body = existing[end + 3:]
+                fm = existing[: end + 3]
+                body = existing[end + 3 :]
                 if "brief:" in fm:
                     fm = re.sub(r"brief:.*", f"brief: {brief}", fm)
                 else:
@@ -419,7 +450,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if content.startswith("---"):
             end = content.find("---", 3)
             if end != -1:
-                content = content[end + 3:].lstrip("\n")
+                content = content[end + 3 :].lstrip("\n")
         fm_lines = [f"sources: [{source_file}]"]
         if brief:
             fm_lines.append(f"brief: {brief}")
@@ -427,7 +458,9 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         path.write_text(frontmatter + content, encoding="utf-8")
 
 
-def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str) -> None:
+def _add_related_link(
+    wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str
+) -> None:
     """Add a cross-reference link to an existing concept page (no LLM call)."""
     concepts_dir = wiki_dir / "concepts"
     path = concepts_dir / f"{concept_slug}.md"
@@ -444,8 +477,8 @@ def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_f
         if text.startswith("---"):
             end = text.find("---", 3)
             if end != -1:
-                fm = text[:end + 3]
-                body = text[end + 3:]
+                fm = text[: end + 3]
+                body = text[end + 3 :]
                 if "sources:" in fm:
                     fm = fm.replace("sources: [", f"sources: [{source_file}, ")
                 else:
@@ -480,7 +513,9 @@ def _backlink_summary(wiki_dir: Path, doc_name: str, concept_slugs: list[str]) -
     new_links = "\n".join(f"- [[concepts/{s}]]" for s in missing)
     if "## Related Concepts" in text:
         # Append into existing section
-        text = text.replace("## Related Concepts\n", f"## Related Concepts\n{new_links}\n", 1)
+        text = text.replace(
+            "## Related Concepts\n", f"## Related Concepts\n{new_links}\n", 1
+        )
     else:
         text += f"\n\n## Related Concepts\n{new_links}\n"
     summary_path.write_text(text, encoding="utf-8")
@@ -506,14 +541,20 @@ def _backlink_concepts(wiki_dir: Path, doc_name: str, concept_slugs: list[str]) 
         if link in text:
             continue
         if "## Related Documents" in text:
-            text = text.replace("## Related Documents\n", f"## Related Documents\n- {link}\n", 1)
+            text = text.replace(
+                "## Related Documents\n", f"## Related Documents\n- {link}\n", 1
+            )
         else:
             text += f"\n\n## Related Documents\n- {link}\n"
         path.write_text(text, encoding="utf-8")
 
+
 def _update_index(
-    wiki_dir: Path, doc_name: str, concept_names: list[str],
-    doc_brief: str = "", concept_briefs: dict[str, str] | None = None,
+    wiki_dir: Path,
+    doc_name: str,
+    concept_names: list[str],
+    doc_brief: str = "",
+    concept_briefs: dict[str, str] | None = None,
     doc_type: str = "short",
 ) -> None:
     """Append document and concept entries to index.md.
@@ -551,7 +592,9 @@ def _update_index(
             concept_entry += f" — {concept_briefs[name]}"
         if _section_contains_link(lines, "## Concepts", concept_link):
             if name in concept_briefs:
-                _replace_section_entry(lines, "## Concepts", concept_link, concept_entry)
+                _replace_section_entry(
+                    lines, "## Concepts", concept_link, concept_entry
+                )
         else:
             _insert_section_entry(lines, "## Concepts", concept_entry)
 
@@ -587,14 +630,22 @@ async def _compile_concepts(
     # --- Step 2: Get concepts plan (A cached) ---
     concept_briefs = _read_concept_briefs(wiki_dir)
 
-    plan_raw = _llm_call(model, [
-        system_msg,
-        doc_msg,
-        {"role": "assistant", "content": summary},
-        {"role": "user", "content": _CONCEPTS_PLAN_USER.format(
-            concept_briefs=concept_briefs,
-        )},
-    ], "concepts-plan", max_tokens=1024)
+    plan_raw = _llm_call(
+        model,
+        [
+            system_msg,
+            doc_msg,
+            {"role": "assistant", "content": summary},
+            {
+                "role": "user",
+                "content": _CONCEPTS_PLAN_USER.format(
+                    concept_briefs=concept_briefs,
+                ),
+            },
+        ],
+        "concepts-plan",
+        max_tokens=1024,
+    )
 
     try:
         parsed = _parse_json(plan_raw)
@@ -629,15 +680,23 @@ async def _compile_concepts(
         name = concept["name"]
         title = concept.get("title", name)
         async with semaphore:
-            raw = await _llm_call_async(model, [
-                system_msg,
-                doc_msg,
-                {"role": "assistant", "content": summary},
-                {"role": "user", "content": _CONCEPT_PAGE_USER.format(
-                    title=title, doc_name=doc_name,
-                    update_instruction="",
-                )},
-            ], f"concept: {name}")
+            raw = await _llm_call_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,
+                    {"role": "assistant", "content": summary},
+                    {
+                        "role": "user",
+                        "content": _CONCEPT_PAGE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                            update_instruction="",
+                        ),
+                    },
+                ],
+                f"concept: {name}",
+            )
         try:
             parsed = _parse_json(raw)
             brief = parsed.get("brief", "")
@@ -660,15 +719,23 @@ async def _compile_concepts(
         else:
             existing_content = "(page not found — create from scratch)"
         async with semaphore:
-            raw = await _llm_call_async(model, [
-                system_msg,
-                doc_msg,
-                {"role": "assistant", "content": summary},
-                {"role": "user", "content": _CONCEPT_UPDATE_USER.format(
-                    title=title, doc_name=doc_name,
-                    existing_content=existing_content,
-                )},
-            ], f"update: {name}")
+            raw = await _llm_call_async(
+                model,
+                [
+                    system_msg,
+                    doc_msg,
+                    {"role": "assistant", "content": summary},
+                    {
+                        "role": "user",
+                        "content": _CONCEPT_UPDATE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                            existing_content=existing_content,
+                        ),
+                    },
+                ],
+                f"update: {name}",
+            )
         try:
             parsed = _parse_json(raw)
             brief = parsed.get("brief", "")
@@ -686,7 +753,9 @@ async def _compile_concepts(
 
     if tasks:
         total = len(tasks)
-        sys.stdout.write(f"    Generating {total} concept(s) (concurrency={max_concurrency})...\n")
+        sys.stdout.write(
+            f"    Generating {total} concept(s) (concurrency={max_concurrency})...\n"
+        )
         sys.stdout.flush()
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -696,7 +765,9 @@ async def _compile_concepts(
                 logger.warning("Concept generation failed: %s", r)
                 continue
             name, page_content, is_update, brief = r
-            _write_concept(wiki_dir, name, page_content, source_file, is_update, brief=brief)
+            _write_concept(
+                wiki_dir, name, page_content, source_file, is_update, brief=brief
+            )
             safe_name = _sanitize_concept_name(name)
             concept_names.append(safe_name)
             if brief:
@@ -714,9 +785,14 @@ async def _compile_concepts(
         _backlink_concepts(wiki_dir, doc_name, all_concept_slugs)
 
     # --- Step 4: Update index (code only) ---
-    _update_index(wiki_dir, doc_name, concept_names,
-                  doc_brief=doc_brief, concept_briefs=concept_briefs_map,
-                  doc_type=doc_type)
+    _update_index(
+        wiki_dir,
+        doc_name,
+        concept_names,
+        doc_brief=doc_brief,
+        concept_briefs=concept_briefs_map,
+        doc_type=doc_type,
+    )
 
 
 async def compile_short_doc(
@@ -742,12 +818,20 @@ async def compile_short_doc(
     content = source_path.read_text(encoding="utf-8")
 
     # Base context A: system + document
-    system_msg = {"role": "system", "content": _SYSTEM_TEMPLATE.format(
-        schema_md=schema_md, language=language,
-    )}
-    doc_msg = {"role": "user", "content": _SUMMARY_USER.format(
-        doc_name=doc_name, content=content,
-    )}
+    system_msg = {
+        "role": "system",
+        "content": _SYSTEM_TEMPLATE.format(
+            schema_md=schema_md,
+            language=language,
+        ),
+    }
+    doc_msg = {
+        "role": "user",
+        "content": _SUMMARY_USER.format(
+            doc_name=doc_name,
+            content=content,
+        ),
+    }
 
     # --- Step 1: Generate summary ---
     summary_raw = _llm_call(model, [system_msg, doc_msg], "summary")
@@ -762,8 +846,15 @@ async def compile_short_doc(
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     await _compile_concepts(
-        wiki_dir, kb_dir, model, system_msg, doc_msg,
-        summary, doc_name, max_concurrency, doc_brief=doc_brief,
+        wiki_dir,
+        kb_dir,
+        model,
+        system_msg,
+        doc_msg,
+        summary,
+        doc_name,
+        max_concurrency,
+        doc_brief=doc_brief,
         doc_type="short",
     )
 
@@ -793,19 +884,35 @@ async def compile_long_doc(
     summary_content = summary_path.read_text(encoding="utf-8")
 
     # Base context A
-    system_msg = {"role": "system", "content": _SYSTEM_TEMPLATE.format(
-        schema_md=schema_md, language=language,
-    )}
-    doc_msg = {"role": "user", "content": _LONG_DOC_SUMMARY_USER.format(
-        doc_name=doc_name, doc_id=doc_id, content=summary_content,
-    )}
+    system_msg = {
+        "role": "system",
+        "content": _SYSTEM_TEMPLATE.format(
+            schema_md=schema_md,
+            language=language,
+        ),
+    }
+    doc_msg = {
+        "role": "user",
+        "content": _LONG_DOC_SUMMARY_USER.format(
+            doc_name=doc_name,
+            doc_id=doc_id,
+            content=summary_content,
+        ),
+    }
 
     # --- Step 1: Generate overview ---
     overview = _llm_call(model, [system_msg, doc_msg], "overview")
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     await _compile_concepts(
-        wiki_dir, kb_dir, model, system_msg, doc_msg,
-        overview, doc_name, max_concurrency, doc_brief=doc_description,
+        wiki_dir,
+        kb_dir,
+        model,
+        system_msg,
+        doc_msg,
+        overview,
+        doc_name,
+        max_concurrency,
+        doc_brief=doc_description,
         doc_type="pageindex",
     )

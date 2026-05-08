@@ -65,7 +65,7 @@ Existing concept pages:
 Return a JSON object with three keys:
 
 1. "create" — new concepts not covered by any existing page. Array of objects:
-   {{"name": "concept-name", "title": "Human-Readable Title"}}
+   {{"name": "中文概念名称", "title": "可阅读的标题"}}
 
 2. "update" — existing concepts that have significant new information from \
 this document worth integrating. Array of objects:

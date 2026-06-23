@@ -606,6 +606,8 @@ def init(model, language):
         "model": model,
         "language": language,
         "pageindex_threshold": DEFAULT_CONFIG["pageindex_threshold"],
+        "eval_concurrency": DEFAULT_CONFIG["eval_concurrency"],
+        "compile_concurrency": DEFAULT_CONFIG["compile_concurrency"],
     }
     save_config(openkb_dir / "config.yaml", config)
     atomic_write_json(openkb_dir / "hashes.json", {})

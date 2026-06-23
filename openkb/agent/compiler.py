@@ -1936,7 +1936,7 @@ async def compile_short_doc(
     source_path: Path,
     kb_dir: Path,
     model: str,
-    max_concurrency: int = DEFAULT_COMPILE_CONCURRENCY,
+    max_concurrency: int | None = None,
 ) -> None:
     """Compile a short document using a multi-step LLM pipeline with caching.
 
@@ -1949,6 +1949,10 @@ async def compile_short_doc(
     config = load_config(openkb_dir / "config.yaml")
     language: str = config.get("language", "en")
     entity_types = resolve_entity_types(config)
+
+    # Resolve concurrency: explicit param > config > hard-coded default.
+    if max_concurrency is None:
+        max_concurrency = config.get("compile_concurrency", DEFAULT_COMPILE_CONCURRENCY)
 
     wiki_dir = kb_dir / "wiki"
     schema_md = get_agents_md(wiki_dir)
@@ -1999,7 +2003,7 @@ async def compile_long_doc(
     kb_dir: Path,
     model: str,
     doc_description: str = "",
-    max_concurrency: int = DEFAULT_COMPILE_CONCURRENCY,
+    max_concurrency: int | None = None,
 ) -> None:
     """Compile a long (PageIndex) document's concepts and index.
 
@@ -2012,6 +2016,10 @@ async def compile_long_doc(
     config = load_config(openkb_dir / "config.yaml")
     language: str = config.get("language", "en")
     entity_types = resolve_entity_types(config)
+
+    # Resolve concurrency: explicit param > config > hard-coded default.
+    if max_concurrency is None:
+        max_concurrency = config.get("compile_concurrency", DEFAULT_COMPILE_CONCURRENCY)
 
     wiki_dir = kb_dir / "wiki"
     schema_md = get_agents_md(wiki_dir)

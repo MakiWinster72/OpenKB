@@ -68,6 +68,52 @@ _KNOWN_PROVIDER_KEYS = (
 # missing-key warning would be a false alarm for them.
 _OAUTH_PROVIDERS = {"chatgpt", "github_copilot"}
 
+# Public providers with well-known official endpoints — for these the user
+# never needs to set a base URL, so ``openkb init`` skips the prompt.
+# Anything outside this set (``ollama/``, ``vllm/``, ``openrouter/``,
+# ``custom/``, ...) is presumed self-hosted / proxied and triggers the
+# base-URL prompt.
+_KNOWN_PUBLIC_PROVIDERS: frozenset[str] = frozenset({
+    "openai", "anthropic", "gemini", "google", "deepseek", "mistral",
+    "moonshot", "zhipuai", "dashscope",
+})
+
+# LiteLLM reads these per-provider env vars to override the base URL.
+# Used by ``openkb init`` to map a user-supplied base URL into the right
+# ``*_API_BASE`` key in the KB's .env. LiteLLM also accepts ``api_base=``
+# per-call and ``litellm.api_base`` globally, but the env-var route is
+# provider-agnostic and survives model switches without code changes.
+_PROVIDER_TO_BASE_ENV: dict[str, str] = {
+    "openai": "OPENAI_API_BASE",
+    "anthropic": "ANTHROPIC_API_BASE",
+    "gemini": "GEMINI_API_BASE",
+    "google": "GOOGLE_API_BASE",
+    "deepseek": "DEEPSEEK_API_BASE",
+    "mistral": "MISTRAL_API_BASE",
+    "moonshot": "MOONSHOT_API_BASE",
+    "zhipuai": "ZHIPUAI_API_BASE",
+    "dashscope": "DASHSCOPE_API_BASE",
+    # Common proxies / aggregators. Users with truly custom providers can
+    # always edit .env by hand.
+    "openrouter": "OPENROUTER_API_BASE",
+    "ollama": "OLLAMA_API_BASE",
+    "vllm": "OPENAI_API_BASE",  # vLLM exposes an OpenAI-compatible endpoint
+}
+
+
+def _base_url_env_for_provider(provider: str | None) -> str | None:
+    """Return the LiteLLM ``*_API_BASE`` env var name for ``provider``.
+
+    Falls back to ``OPENAI_API_BASE`` for unknown prefixes — most local /
+    proxy servers (vLLM, LM Studio, xinference, etc.) expose an
+    OpenAI-compatible endpoint, so this covers the common case.
+    """
+    if not provider:
+        return None
+    if provider in _PROVIDER_TO_BASE_ENV:
+        return _PROVIDER_TO_BASE_ENV[provider]
+    return "OPENAI_API_BASE"
+
 
 def _extract_provider(model: str) -> str | None:
     """Extract the LiteLLM provider name from a model string.
@@ -154,6 +200,19 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
         for env_var in _KNOWN_PROVIDER_KEYS:
             if not os.environ.get(env_var):
                 os.environ[env_var] = api_key
+
+    # Base URL: pick up the provider-specific *_API_BASE env var (written
+    # by `openkb init` for self-hosted / proxied providers) and apply it
+    # to litellm.api_base so LiteLLM uses it on every request. LiteLLM
+    # already reads e.g. OPENAI_API_BASE natively for some providers, but
+    # setting litellm.api_base makes the override reliable across
+    # providers and call paths.
+    base_env = _base_url_env_for_provider(provider)
+    base_url = ""
+    if base_env:
+        base_url = os.environ.get(base_env, "").strip()
+    if base_url:
+        litellm.api_base = base_url
 
 # Supported document extensions for the `add` command
 SUPPORTED_EXTENSIONS = {
@@ -524,6 +583,35 @@ def _model_option_callback(_ctx, _param, value):
     return _coerce_model(value)
 
 
+_BASE_URL_MAX_LEN = 2048
+
+
+def _coerce_base_url(value: str | None) -> str | None:
+    """Strip a base URL; treat blanks as unset; reject unsafe values.
+
+    Mirrors ``_coerce_model``. The URL is written verbatim to ``.env`` and
+    may be echoed in CLI output, so embedded control characters would
+    corrupt that file / output and are rejected. Capping length keeps
+    pathological values out of the .env file.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > _BASE_URL_MAX_LEN or any(c in value for c in "\n\r\t"):
+        raise click.BadParameter(
+            f"base URL must be {_BASE_URL_MAX_LEN} characters or fewer "
+            "with no control characters",
+            param_hint="'--base-url'",
+        )
+    return value
+
+
+def _base_url_option_callback(_ctx, _param, value):
+    return _coerce_base_url(value)
+
+
 def _stdin_is_tty() -> bool:
     """Return True when stdin is a real terminal.
 
@@ -551,7 +639,19 @@ def _stdin_is_tty() -> bool:
     callback=_language_option_callback,
     help="Wiki output language (e.g. 'en', 'ko'). Skips the interactive prompt when set.",
 )
-def init(model, language):
+@click.option(
+    "--base-url", "-u", "base_url",
+    default=None, metavar="URL",
+    callback=_base_url_option_callback,
+    help=(
+        "LLM API base URL (for self-hosted / proxied providers, e.g. "
+        "'http://localhost:11434' for Ollama). When the chosen model is a "
+        "public provider (OpenAI, Anthropic, Gemini, DeepSeek, ...) the "
+        "interactive prompt is skipped automatically. Stored in .env as "
+        "the provider-specific *_API_BASE variable."
+    ),
+)
+def init(model, language, base_url):
     """Initialise a new knowledge base in the current directory."""
     openkb_dir = Path(".openkb")
     if openkb_dir.exists():
@@ -574,6 +674,18 @@ def init(model, language):
         ))
     if not model:
         model = DEFAULT_CONFIG["model"]
+    # Only ask for a base URL when the chosen model isn't a known public
+    # provider (i.e. it's self-hosted, proxied, or otherwise needs a
+    # non-default endpoint). The --base-url flag overrides this gate.
+    provider = _extract_provider(model)
+    if base_url is None and _stdin_is_tty() and provider not in _KNOWN_PUBLIC_PROVIDERS:
+        base_url = _coerce_base_url(click.prompt(
+            "API base URL (for self-hosted / proxied providers, enter to skip)",
+            default="",
+            show_default=False,
+        ))
+    if not base_url:
+        base_url = None
     api_key = click.prompt(
         "LLM API Key (saved to .env, enter to skip)",
         default="",
@@ -612,20 +724,39 @@ def init(model, language):
     save_config(openkb_dir / "config.yaml", config)
     atomic_write_json(openkb_dir / "hashes.json", {})
 
-    # Write API key to KB-local .env (0600) if the user provided one
+    # Write secrets to KB-local .env (0600) if the user provided any.
+    # The API key goes in as LLM_API_KEY; the base URL (when given) goes
+    # in as the provider-specific *_API_BASE so LiteLLM picks it up.
+    env_writes: dict[str, str] = {}
     if api_key:
+        env_writes["LLM_API_KEY"] = api_key
+    if base_url:
+        base_env_var = _base_url_env_for_provider(provider)
+        if base_env_var:
+            env_writes[base_env_var] = base_url
+    if env_writes:
         env_path = Path(".env")
         if env_path.exists():
-            click.echo(".env already exists, skipping write. Add LLM_API_KEY manually if needed.")
+            click.echo(
+                ".env already exists, skipping write. Add the missing "
+                "entries manually if needed: " + ", ".join(env_writes),
+            )
         else:
-            env_path.write_text(f"LLM_API_KEY={api_key}\n", encoding="utf-8")
+            env_path.write_text(
+                "".join(f"{k}={v}\n" for k, v in env_writes.items()),
+                encoding="utf-8",
+            )
             os.chmod(env_path, 0o600)
-            click.echo("Saved LLM API key to .env.")
+            click.echo("Saved to .env: " + ", ".join(env_writes))
 
     # Register this KB in the global config
     register_kb(Path.cwd())
 
     click.echo("Knowledge base initialized.")
+    click.echo(
+        f"  • Review .env and {openkb_dir / 'config.yaml'} if anything "
+        "needs adjusting."
+    )
 
 
 @cli.command()

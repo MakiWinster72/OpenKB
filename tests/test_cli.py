@@ -276,6 +276,180 @@ def test_init_model_prompt_accepts_input(tmp_path):
         assert config["model"] == "anthropic/claude-opus-4-6"
 
 
+# ---------------------------------------------------------------------------
+# Base URL prompt + .env wiring
+# ---------------------------------------------------------------------------
+
+
+def test_init_public_provider_skips_base_url_prompt(tmp_path):
+    """OpenAI / Anthropic / etc. use official endpoints — no prompt."""
+    from openkb.cli import _KNOWN_PUBLIC_PROVIDERS  # noqa: F401  (sanity)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        # Inputs: model (gpt-5.4), api key (blank), language (blank)
+        result = runner.invoke(cli, ["init"], input="gpt-5.4\n\n\n")
+        assert result.exit_code == 0, result.output
+        # The base-URL prompt must NOT appear for a public provider.
+        assert "API base URL" not in result.output
+
+
+def test_init_custom_provider_prompts_for_base_url(tmp_path):
+    """A non-public provider (e.g. ollama/...) must trigger the prompt."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        # Inputs: model (ollama/llama3), base url, api key (blank), language (blank)
+        result = runner.invoke(
+            cli, ["init"],
+            input="ollama/llama3\nhttp://localhost:11434\n\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "API base URL" in result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        # ollama/ → OLLAMA_API_BASE per the provider map.
+        assert "OLLAMA_API_BASE=http://localhost:11434" in env_content
+        assert "LLM_API_KEY" not in env_content  # user skipped the key
+
+
+def test_init_base_url_flag_writes_env(tmp_path):
+    """--base-url on the CLI sets the URL without prompting."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, [
+                "init",
+                "--model", "openai/gpt-5.4-mini",
+                "--base-url", "https://proxy.example.com/v1",
+            ],
+            input="\n\n",  # api key, language
+        )
+        assert result.exit_code == 0, result.output
+        # Public provider but --base-url forced it: prompt should NOT fire.
+        assert "API base URL" not in result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        # openai/ → OPENAI_API_BASE.
+        assert "OPENAI_API_BASE=https://proxy.example.com/v1" in env_content
+
+
+def test_init_base_url_and_key_written_together(tmp_path):
+    """Both LLM_API_KEY and the base URL land in .env when provided."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, [
+                "init",
+                "--model", "vllm/custom-llama",
+                "--base-url", "http://gpu-host:8000/v1",
+            ],
+            input="sk-test-key\n\n",  # api key, language
+        )
+        assert result.exit_code == 0, result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "LLM_API_KEY=sk-test-key" in env_content
+        # vllm maps to OPENAI_API_BASE in _PROVIDER_TO_BASE_ENV.
+        assert "OPENAI_API_BASE=http://gpu-host:8000/v1" in env_content
+
+        # chmod 600 was applied.
+        import stat
+        mode = Path(".env").stat().st_mode
+        assert stat.S_IMODE(mode) == 0o600
+
+
+def test_init_base_url_blank_prompt_skips_write(tmp_path):
+    """Empty base URL answer ⇒ no *_API_BASE line in .env."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, ["init", "--model", "ollama/llama3"],
+            input="\n\n\n",  # blank base url, blank api key, blank language
+        )
+        assert result.exit_code == 0, result.output
+
+        from pathlib import Path
+        # No key + no URL ⇒ no .env file at all.
+        assert not Path(".env").exists()
+
+
+def test_init_existing_env_preserved(tmp_path):
+    """If .env already exists, init must not clobber it; user is told."""
+    from pathlib import Path
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
+        # Pre-existing .env.
+        Path(".env").write_text("EXISTING=keep-me\n", encoding="utf-8")
+        with patch("openkb.cli.register_kb"), \
+             patch("openkb.cli._stdin_is_tty", return_value=True):
+            result = runner.invoke(
+                cli, ["init", "--model", "ollama/llama3"],
+                input="http://localhost:11434\n\n\n",
+            )
+            assert result.exit_code == 0, result.output
+
+        # Original content preserved verbatim; new key was NOT appended.
+        assert Path(".env").read_text() == "EXISTING=keep-me\n"
+        assert "skipping write" in result.output
+
+
+def test_init_rejects_base_url_with_control_chars(tmp_path):
+    """A --base-url value with embedded newlines is unsafe (would corrupt .env)."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"):
+        result = runner.invoke(
+            cli, [
+                "init",
+                "--base-url", "http://x\nLLM_API_KEY=stolen",
+            ],
+            input="\n\n",
+        )
+        assert result.exit_code != 0
+        assert "--base-url" in result.output
+
+        from pathlib import Path
+        # Init must abort before writing any KB state.
+        assert not Path(".openkb").exists()
+
+
+def test_init_rejects_overly_long_base_url(tmp_path):
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"):
+        result = runner.invoke(
+            cli, ["init", "--base-url", "x" * 3000],
+            input="\n\n",
+        )
+        assert result.exit_code != 0
+        assert "--base-url" in result.output
+
+
+def test_init_emits_post_init_reminder(tmp_path):
+    """After init succeeds, the user is pointed at .env and config.yaml."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"):
+        result = runner.invoke(cli, ["init"], input="\n\n")
+        assert result.exit_code == 0, result.output
+        assert "Review .env" in result.output
+        assert "config.yaml" in result.output
+
+
 class TestQueryStreamGate:
     """Regression tests for issue #34.
 

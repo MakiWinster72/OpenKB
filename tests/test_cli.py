@@ -467,7 +467,12 @@ def test_init_minimax_global_region_writes_env(tmp_path):
             input="1\n\n\n",
         )
         assert result.exit_code == 0, result.output
-        assert "MiniMax has two regional endpoints" in result.output
+        # The picker must be visually distinct (heading + bracketed
+        # options) so it can't be mistaken for a continuation of the
+        # surrounding model / API-key prompts.
+        assert "MiniMax region" in result.output
+        assert "[1] Global" in result.output
+        assert "[2] China" in result.output
 
         from pathlib import Path
         env_content = Path(".env").read_text()
@@ -491,6 +496,30 @@ def test_init_minimax_china_region_writes_env(tmp_path):
         assert "MINIMAX_API_BASE=https://api.minimaxi.com/v1" in env_content
 
 
+def test_init_minimax_picker_fires_for_typed_model(tmp_path):
+    """The picker must fire when the user TYPES the model interactively,
+    not only when --model is passed. Regression: a previous version
+    silently skipped the picker unless --model was explicit, which made
+    MiniMax users end up with no MINIMAX_API_BASE in .env.
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        # Inputs: model (typed), region, api key, language
+        result = runner.invoke(
+            cli, ["init"],
+            input="minimax/MiniMax-M2.7\n1\nsk-test\nen\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "MiniMax region" in result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "MINIMAX_API_BASE=https://api.minimax.io/v1" in env_content
+        assert "LLM_API_KEY=sk-test" in env_content
+
+
 def test_init_minimax_default_to_global_under_non_tty(tmp_path):
     """Scripted (non-TTY) init falls back to the global endpoint silently."""
     runner = CliRunner()
@@ -502,7 +531,7 @@ def test_init_minimax_default_to_global_under_non_tty(tmp_path):
             input="\n\n",
         )
         assert result.exit_code == 0, result.output
-        assert "regional endpoints" not in result.output
+        assert "MiniMax region" not in result.output
 
         from pathlib import Path
         env_content = Path(".env").read_text()
@@ -524,7 +553,7 @@ def test_init_minimax_base_url_flag_overrides_region_picker(tmp_path):
             input="\n\n",
         )
         assert result.exit_code == 0, result.output
-        assert "regional endpoints" not in result.output  # picker skipped
+        assert "MiniMax region" not in result.output  # picker skipped
 
         from pathlib import Path
         env_content = Path(".env").read_text()

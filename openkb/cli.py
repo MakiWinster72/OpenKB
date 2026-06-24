@@ -633,13 +633,22 @@ def _prompt_minimax_region() -> str:
     ``_MINIMAX_CHINA_URL``. Accepts ``1``/``global`` (default) or
     ``2``/``china``; anything else re-prompts so a typo never silently
     routes the user to the wrong region.
+
+    The output uses blank lines + a clear heading so the picker can't be
+    mistaken for a continuation of the model / API-key prompts around it
+    (which would silently route the user to whichever default happens to
+    win — usually the wrong region).
     """
-    click.echo("MiniMax has two regional endpoints:")
-    click.echo(f"  1. Global ({_MINIMAX_GLOBAL_URL})  [default]")
-    click.echo(f"  2. China  ({_MINIMAX_CHINA_URL})")
+    click.echo()
+    click.echo("── MiniMax region ─────────────────────────────────")
+    click.echo("MiniMax has two regional endpoints under the same")
+    click.echo("`minimax/` LiteLLM prefix — pick one:")
+    click.echo(f"  [1] Global ({_MINIMAX_GLOBAL_URL})   [default]")
+    click.echo(f"  [2] China  ({_MINIMAX_CHINA_URL})")
+    click.echo("──────────────────────────────────────────────────")
     while True:
         choice = click.prompt(
-            "Endpoint (1=Global, 2=China)", default="1", show_default=False,
+            "Region (1=Global, 2=China)", default="1", show_default=False,
         ).strip().lower()
         if choice in ("", "1", "global"):
             return _MINIMAX_GLOBAL_URL

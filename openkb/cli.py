@@ -89,6 +89,56 @@ _KNOWN_PUBLIC_PROVIDERS: frozenset[str] = frozenset({
 _MINIMAX_GLOBAL_URL = "https://api.minimax.io/v1"
 _MINIMAX_CHINA_URL = "https://api.minimaxi.com/v1"
 
+# Maps each LiteLLM provider prefix to the env var LiteLLM reads for
+# its API key. ``openkb init`` uses this to write the *right* variable
+# into .env — not the generic ``LLM_API_KEY`` — so the file matches the
+# provider the user just picked. A value of ``None`` means the provider
+# runs locally and doesn't need a key (ollama, vllm by default).
+#
+# Sources (LiteLLM docs, verified):
+#   OPENAI_API_KEY      docs.litellm.ai/docs/set_keys
+#   ANTHROPIC_API_KEY   docs.litellm.ai/docs/providers/anthropic
+#   GEMINI_API_KEY      docs.litellm.ai/docs/providers/gemini
+#   DEEPSEEK_API_KEY    docs.litellm.ai/docs/providers/deepseek
+#   MISTRAL_API_KEY     docs.litellm.ai/docs/providers/mistral
+#   MOONSHOT_API_KEY    docs.litellm.ai/docs/providers/moonshot
+#   DASHSCOPE_API_KEY   docs.litellm.ai/docs/providers/dashscope
+#   OPENROUTER_API_KEY  docs.litellm.ai/docs/providers/openrouter
+#   MINIMAX_API_KEY     user-specified
+#   ZHIPUAI_API_KEY     the LiteLLM provider was renamed to "Z.AI" but
+#                       still uses the ``zhipuai/`` prefix, so the env
+#                       var is unchanged.
+_PROVIDER_KEY_ENV: dict[str, str | None] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "zhipuai": "ZHIPUAI_API_KEY",
+    "dashscope": "DASHSCOPE_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "ollama": None,    # local server, no key
+    "vllm": "HOSTED_VLLM_API_KEY",  # optional per LiteLLM docs
+}
+
+
+def _key_env_for_provider(provider: str | None) -> str | None:
+    """Return the LiteLLM ``*_API_KEY`` env var for ``provider``.
+
+    Returns ``None`` for providers that don't use a key (ollama, vllm)
+    AND for unknown providers — the latter is intentionally treated as
+    "no canonical name known", so the caller can decide whether to fall
+    back to the generic ``LLM_API_KEY``.
+    """
+    if provider is None:
+        return None
+    if provider in _PROVIDER_KEY_ENV:
+        return _PROVIDER_KEY_ENV[provider]
+    return None
+
 # LiteLLM reads these per-provider env vars to override the base URL.
 # Used by ``openkb init`` to map a user-supplied base URL into the right
 # ``*_API_BASE`` key in the KB's .env. LiteLLM also accepts ``api_base=``
@@ -164,10 +214,11 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
     if global_env.exists():
         load_dotenv(global_env, override=False)
 
-    api_key = os.environ.get("LLM_API_KEY", "")
-
-    # Try to resolve the active provider, extra headers, and request timeout
-    # from the KB config
+    # Resolve the active provider first — its key env var (e.g.
+    # ``OPENAI_API_KEY``) takes priority over the generic ``LLM_API_KEY``
+    # so users who set the provider-specific name directly (the format
+    # ``openkb init`` now writes to .env) get picked up without having to
+    # also export a generic catch-all.
     provider: str | None = None
     extra_headers: dict[str, str] = {}
     timeout: float | None = None
@@ -182,33 +233,40 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
     set_extra_headers(extra_headers)
     set_timeout(timeout)
 
+    provider_key_env = _key_env_for_provider(provider)
+    api_key = ""
+    if provider_key_env:
+        api_key = os.environ.get(provider_key_env, "").strip()
     if not api_key:
-        # Check if any provider key is already set. OAuth-based providers
-        # (ChatGPT subscription, GitHub Copilot) don't use API keys at all,
-        # so the warning is skipped for them.
-        check_keys = (
-            (f"{provider.upper()}_API_KEY",) if provider
-            else _KNOWN_PROVIDER_KEYS
+        api_key = os.environ.get("LLM_API_KEY", "").strip()
+
+    if not api_key:
+        # No key found under either the provider-specific name or the
+        # generic ``LLM_API_KEY``. OAuth-based providers (ChatGPT
+        # subscription, GitHub Copilot) don't use API keys at all, so the
+        # warning is skipped for them. Keyless self-hosted providers
+        # (ollama, vllm) likewise don't need one.
+        keyless = provider is not None and (
+            provider in _OAUTH_PROVIDERS
+            or _PROVIDER_KEY_ENV.get(provider) is None
         )
-        has_key = any(os.environ.get(k) for k in check_keys)
-        if not has_key and provider not in _OAUTH_PROVIDERS:
+        if not keyless:
+            key_hint = provider_key_env or "LLM_API_KEY"
             click.echo(
                 "Warning: No LLM API key found. Set one of:\n"
-                f"  1. {kb_dir / '.env' if kb_dir else '<kb_dir>/.env'} — LLM_API_KEY=sk-...\n"
-                f"  2. {GLOBAL_CONFIG_DIR / '.env'} — LLM_API_KEY=sk-...\n"
-                "  3. Export LLM_API_KEY in your shell profile"
+                f"  1. {kb_dir / '.env' if kb_dir else '<kb_dir>/.env'} — {key_hint}=...\n"
+                f"  2. {GLOBAL_CONFIG_DIR / '.env'} — {key_hint}=...\n"
+                f"  3. Export {key_hint} in your shell profile"
             )
     else:
         litellm.api_key = api_key
 
-        # Dynamically set the provider-specific env var when possible
-        if provider:
-            provider_env = f"{provider.upper()}_API_KEY"
-            if not os.environ.get(provider_env):
-                os.environ[provider_env] = api_key
-
-        # Fallback: also set common provider keys so multi-provider
-        # configs (e.g. PageIndex Cloud) still work
+        # Propagate the key to every provider env var we know about.
+        # This keeps multi-provider setups (e.g. PageIndex Cloud, agent
+        # calls that use a different provider than compile) working
+        # without requiring the user to duplicate the key in .env.
+        if provider_key_env and not os.environ.get(provider_key_env):
+            os.environ[provider_key_env] = api_key
         for env_var in _KNOWN_PROVIDER_KEYS:
             if not os.environ.get(env_var):
                 os.environ[env_var] = api_key
@@ -631,28 +689,59 @@ def _build_env_content(
 
     Always emits the file — even when the user skipped both the API-key
     prompt and the base-URL prompt — so that the user has a discoverable
-    place to drop credentials later. Missing fields are written as
-    commented placeholders naming the right env-var for the chosen
-    provider (e.g. ``MINIMAX_API_BASE`` for MiniMax), so a user who
-    returns to ``.env`` after init still knows what to set.
+    place to drop credentials later.
+
+    Variable naming follows the actual LiteLLM provider (e.g.
+    ``OPENAI_API_KEY`` for OpenAI, ``MINIMAX_API_KEY`` for MiniMax,
+    ``ANTHROPIC_API_BASE`` for Anthropic), not a generic catch-all — so
+    the file reads naturally to someone familiar with the provider. For
+    unknown / local providers, fall back to ``LLM_API_KEY``.
 
     ``env_writes`` maps env-var name → value for fields that should be
     active (uncommented). Any field not present in ``env_writes`` is
-    rendered as a comment.
+    rendered as a commented placeholder.
     """
+    key_env = _key_env_for_provider(provider)
+    # Unknown provider (custom/self-hosted) OR no provider context at
+    # all → fall back to LLM_API_KEY so the value still propagates
+    # through _setup_llm_key. Keyless providers are detected below by
+    # checking ``_PROVIDER_KEY_ENV`` directly.
+    if key_env is None:
+        key_env = "LLM_API_KEY"
+    # Truly keyless provider (ollama, vllm) → skip the key section
+    # entirely; emitting a placeholder would mislead the user.
+    skip_key_section = (
+        provider is not None
+        and provider in _PROVIDER_KEY_ENV
+        and _PROVIDER_KEY_ENV[provider] is None
+    )
+
     lines: list[str] = [
         "# OpenKB environment configuration",
         "# Generated by `openkb init` — edit as needed. See .env.example",
         "# for the full list of supported variables.",
         "",
-        "# LLM API key — works with any LiteLLM-supported provider.",
-        "# Uncomment and paste your key below.",
     ]
-    if "LLM_API_KEY" in env_writes:
-        lines.append(f"LLM_API_KEY={env_writes['LLM_API_KEY']}")
-    else:
-        lines.append("# LLM_API_KEY=sk-...")
-    lines.append("")
+    if not skip_key_section:
+        key_label = key_env or "LLM_API_KEY"
+        lines += [
+            f"# {key_label} — used by LiteLLM to authenticate to "
+            f"{provider or 'your provider'}.",
+            "# Uncomment and paste your key below.",
+        ]
+        if key_env and key_env in env_writes:
+            lines.append(f"{key_env}={env_writes[key_env]}")
+        elif "LLM_API_KEY" in env_writes and key_env != "LLM_API_KEY":
+            # Caller stored the key under the generic name but the
+            # active env var should be the provider-specific one — emit
+            # the generic line commented so the user can move it.
+            lines.append(f"# {key_env}=sk-...")
+            lines.append(f"LLM_API_KEY={env_writes['LLM_API_KEY']}")
+        elif "LLM_API_KEY" in env_writes:
+            lines.append(f"LLM_API_KEY={env_writes['LLM_API_KEY']}")
+        else:
+            lines.append(f"# {key_env}=sk-...")
+        lines.append("")
 
     base_env_var = _base_url_env_for_provider(provider)
     if base_env_var is not None:
@@ -836,7 +925,11 @@ def init(model, language, base_url):
     # right env-var for the chosen provider.
     env_writes: dict[str, str] = {}
     if api_key:
-        env_writes["LLM_API_KEY"] = api_key
+        # Write under the provider-specific env var (e.g. OPENAI_API_KEY)
+        # so the file matches what LiteLLM actually reads; fall back to
+        # the generic name for unknown / keyless providers.
+        key_env = _key_env_for_provider(provider) or "LLM_API_KEY"
+        env_writes[key_env] = api_key
     if base_url:
         base_env_var = _base_url_env_for_provider(provider)
         if base_env_var:

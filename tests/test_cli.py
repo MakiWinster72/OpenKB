@@ -297,23 +297,24 @@ def test_init_public_provider_skips_base_url_prompt(tmp_path):
 
 
 def test_init_custom_provider_prompts_for_base_url(tmp_path):
-    """A non-public provider (e.g. ollama/...) must trigger the prompt."""
+    """A non-public provider (e.g. custom/...) must trigger the prompt."""
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path), \
          patch("openkb.cli.register_kb"), \
          patch("openkb.cli._stdin_is_tty", return_value=True):
-        # Inputs: model (ollama/llama3), base url, api key (blank), language (blank)
+        # Inputs: model (custom/my-model), base url, api key (blank), language (blank)
         result = runner.invoke(
             cli, ["init"],
-            input="ollama/llama3\nhttp://localhost:11434\n\n\n",
+            input="custom/my-model\nhttp://localhost:8080/v1\n\n\n",
         )
         assert result.exit_code == 0, result.output
         assert "API base URL" in result.output
 
         from pathlib import Path
         env_content = Path(".env").read_text()
-        # ollama/ → OLLAMA_API_BASE per the provider map.
-        assert "OLLAMA_API_BASE=http://localhost:11434" in env_content
+        # custom/ is unknown → falls back to OPENAI_API_BASE (most
+        # proxies are OAI-compatible) and the generic LLM_API_KEY.
+        assert "OPENAI_API_BASE=http://localhost:8080/v1" in env_content
         # User skipped the key — it must appear only as a COMMENTED
         # placeholder, never as an active assignment.
         assert "# LLM_API_KEY=" in env_content
@@ -322,6 +323,27 @@ def test_init_custom_provider_prompts_for_base_url(tmp_path):
             assert not stripped.startswith("LLM_API_KEY="), (
                 f"LLM_API_KEY must not be active when user skipped: {line!r}"
             )
+
+
+def test_init_ollama_provider_no_key_section(tmp_path):
+    """Ollama runs locally and doesn't take an API key — .env must not
+    mislead the user with a placeholder.
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, ["init"],
+            input="ollama/llama3\nhttp://localhost:11434\n\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "OLLAMA_API_BASE=http://localhost:11434" in env_content
+        # No key section at all — ollama doesn't need one.
+        assert "_API_KEY=" not in env_content
 
 
 def test_init_base_url_flag_writes_env(tmp_path):
@@ -366,8 +388,8 @@ def test_init_base_url_and_key_written_together(tmp_path):
 
         from pathlib import Path
         env_content = Path(".env").read_text()
-        assert "LLM_API_KEY=sk-test-key" in env_content
-        # vllm maps to OPENAI_API_BASE in _PROVIDER_TO_BASE_ENV.
+        # vllm → HOSTED_VLLM_API_KEY (LiteLLM), OPENAI_API_BASE for URL.
+        assert "HOSTED_VLLM_API_KEY=sk-test-key" in env_content
         assert "OPENAI_API_BASE=http://gpu-host:8000/v1" in env_content
 
         # chmod 600 was applied.
@@ -385,9 +407,12 @@ def test_init_base_url_blank_prompt_still_writes_env_with_comments(tmp_path):
     with runner.isolated_filesystem(temp_dir=tmp_path), \
          patch("openkb.cli.register_kb"), \
          patch("openkb.cli._stdin_is_tty", return_value=True):
+        # Use anthropic so both the key and base URL are present as
+        # commented placeholders. (ollama is keyless — its .env has no
+        # key section at all, which we test separately.)
         result = runner.invoke(
-            cli, ["init", "--model", "ollama/llama3"],
-            input="\n\n\n",  # blank base url, blank api key, blank language
+            cli, ["init", "--model", "anthropic/claude-sonnet-4-6"],
+            input="\n\n\n",  # blank key, blank language
         )
         assert result.exit_code == 0, result.output
 
@@ -399,15 +424,15 @@ def test_init_base_url_blank_prompt_still_writes_env_with_comments(tmp_path):
         # No active assignments should leak in for fields the user skipped.
         for line in content.splitlines():
             stripped = line.lstrip()
-            assert not stripped.startswith("LLM_API_KEY="), (
-                f"LLM_API_KEY must not be active when user skipped: {line!r}"
+            assert not stripped.startswith("ANTHROPIC_API_KEY="), (
+                f"ANTHROPIC_API_KEY must not be active when user skipped: {line!r}"
             )
-            assert not stripped.startswith("OLLAMA_API_BASE="), (
-                f"OLLAMA_API_BASE must not be active when user skipped: {line!r}"
+            assert not stripped.startswith("ANTHROPIC_API_BASE="), (
+                f"ANTHROPIC_API_BASE must not be active when user skipped: {line!r}"
             )
         # Both placeholders appear as comments so the user knows what to set.
-        assert "# LLM_API_KEY=" in content
-        assert "# OLLAMA_API_BASE=" in content
+        assert "# ANTHROPIC_API_KEY=" in content
+        assert "# ANTHROPIC_API_BASE=" in content
 
         # chmod 600 still applied even when content is mostly comments.
         import stat
@@ -545,7 +570,7 @@ def test_init_minimax_picker_fires_for_typed_model(tmp_path):
         from pathlib import Path
         env_content = Path(".env").read_text()
         assert "MINIMAX_API_BASE=https://api.minimax.io/v1" in env_content
-        assert "LLM_API_KEY=sk-test" in env_content
+        assert "MINIMAX_API_KEY=sk-test" in env_content
 
 
 def test_init_minimax_default_to_global_under_non_tty(tmp_path):
@@ -624,7 +649,7 @@ def test_init_minimax_key_and_url_written_together(tmp_path):
 
         from pathlib import Path
         env_content = Path(".env").read_text()
-        assert "LLM_API_KEY=sk-minimax-key" in env_content
+        assert "MINIMAX_API_KEY=sk-minimax-key" in env_content
         assert "MINIMAX_API_BASE=https://api.minimax.io/v1" in env_content
 
 
@@ -661,9 +686,11 @@ def test_init_minimax_no_key_writes_env_with_placeholder(tmp_path):
         from pathlib import Path
         content = Path(".env").read_text()
         assert "MINIMAX_API_BASE=https://api.minimaxi.com/v1" in content
-        # Key placeholder present as a comment, never as active assignment.
-        assert "# LLM_API_KEY=" in content
+        # Key placeholder present as a comment under the provider-specific
+        # name (MINIMAX_API_KEY), never as an active assignment.
+        assert "# MINIMAX_API_KEY=" in content
         for line in content.splitlines():
+            assert not line.lstrip().startswith("MINIMAX_API_KEY=")
             assert not line.lstrip().startswith("LLM_API_KEY=")
 
 
@@ -673,6 +700,7 @@ def test_build_env_content_no_provider_no_base_url():
     """
     from openkb.cli import _build_env_content
     content = _build_env_content({}, provider=None)
+    # provider=None → generic LLM_API_KEY placeholder.
     assert "# LLM_API_KEY=" in content
     # No provider ⇒ no base URL section at all (no misleading hint).
     assert "_API_BASE=" not in content
@@ -681,15 +709,83 @@ def test_build_env_content_no_provider_no_base_url():
 def test_build_env_content_active_key_and_placeholder_url():
     from openkb.cli import _build_env_content
     content = _build_env_content(
-        {"LLM_API_KEY": "sk-test"}, provider="anthropic",
+        {"ANTHROPIC_API_KEY": "sk-test"}, provider="anthropic",
     )
-    # Active key written uncommented.
-    assert "LLM_API_KEY=sk-test" in content
+    # Active key written under the provider-specific name.
+    assert "ANTHROPIC_API_KEY=sk-test" in content
+    # No generic LLM_API_KEY leaks in for a known provider.
+    assert "LLM_API_KEY=sk-test" not in content
     # Base URL placeholder for anthropic is present but commented.
     assert "# ANTHROPIC_API_BASE=" in content
     # No active (uncommented) assignment leaks the placeholder URL.
     for line in content.splitlines():
         assert not line.lstrip().startswith("ANTHROPIC_API_BASE=")
+
+
+@pytest.mark.parametrize("provider,key_env,key_value", [
+    ("openai", "OPENAI_API_KEY", "sk-openai"),
+    ("anthropic", "ANTHROPIC_API_KEY", "sk-ant"),
+    ("gemini", "GEMINI_API_KEY", "AIza-test"),
+    ("deepseek", "DEEPSEEK_API_KEY", "sk-ds"),
+    ("mistral", "MISTRAL_API_KEY", "mistral-key"),
+    ("moonshot", "MOONSHOT_API_KEY", "ms-key"),
+    ("dashscope", "DASHSCOPE_API_KEY", "ds-key"),
+    ("openrouter", "OPENROUTER_API_KEY", "or-key"),
+    ("minimax", "MINIMAX_API_KEY", "minimax-key"),
+    ("zhipuai", "ZHIPUAI_API_KEY", "zhipu-key"),
+])
+def test_build_env_content_per_provider_key_naming(provider, key_env, key_value):
+    """Regression: each LiteLLM provider has its own *_API_KEY env var,
+    and ``openkb init`` must write the right one — not the generic
+    ``LLM_API_KEY`` — so the file reads naturally to anyone familiar
+    with that provider.
+    """
+    from openkb.cli import _build_env_content
+    content = _build_env_content({key_env: key_value}, provider)
+    assert f"{key_env}={key_value}" in content
+    # The active line must be uncommented.
+    active_lines = [
+        line for line in content.splitlines()
+        if line.startswith(f"{key_env}=")
+    ]
+    assert active_lines == [f"{key_env}={key_value}"]
+
+
+def test_key_env_for_provider_known_and_unknown():
+    from openkb.cli import _key_env_for_provider
+    assert _key_env_for_provider("openai") == "OPENAI_API_KEY"
+    assert _key_env_for_provider("minimax") == "MINIMAX_API_KEY"
+    # ollama has no key (None, not the generic fallback).
+    assert _key_env_for_provider("ollama") is None
+    # Unknown provider also returns None (caller decides fallback).
+    assert _key_env_for_provider("custom-thing") is None
+    assert _key_env_for_provider(None) is None
+
+
+def test_setup_llm_key_reads_provider_specific_env_var(tmp_path):
+    """``_setup_llm_key`` must pick up the provider-specific env var
+    (the format ``openkb init`` now writes) without requiring a
+    generic ``LLM_API_KEY`` fallback.
+    """
+    from pathlib import Path
+    from openkb import cli as cli_mod
+
+    monkeypatch = pytest.MonkeyPatch()
+    # Simulate what openkb init now writes: only the provider-specific
+    # env var is set; LLM_API_KEY is empty.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-direct-openai")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    try:
+        kb_dir = tmp_path / "kb"
+        kb_dir.mkdir()
+        (kb_dir / ".openkb").mkdir()
+        (kb_dir / ".openkb/config.yaml").write_text(
+            "model: openai/gpt-5.4-mini\n", encoding="utf-8",
+        )
+        cli_mod._setup_llm_key(kb_dir)
+        assert cli_mod.litellm.api_key == "sk-direct-openai"
+    finally:
+        monkeypatch.undo()
 
 
 def test_setup_llm_key_applies_minimax_base_url(tmp_path):

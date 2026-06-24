@@ -450,6 +450,165 @@ def test_init_emits_post_init_reminder(tmp_path):
         assert "config.yaml" in result.output
 
 
+# ---------------------------------------------------------------------------
+# MiniMax region picker (global / China)
+# ---------------------------------------------------------------------------
+
+
+def test_init_minimax_global_region_writes_env(tmp_path):
+    """Interactive choice 1 ⇒ MINIMAX_API_BASE points to the global endpoint."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        # Inputs: model (flag), region (1 = global), api key, language
+        result = runner.invoke(
+            cli, ["init", "--model", "minimax/MiniMax-M2.7"],
+            input="1\n\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "MiniMax has two regional endpoints" in result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "MINIMAX_API_BASE=https://api.minimax.io/v1" in env_content
+
+
+def test_init_minimax_china_region_writes_env(tmp_path):
+    """Interactive choice 2 ⇒ MINIMAX_API_BASE points to the China endpoint."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, ["init", "--model", "minimax/MiniMax-M3"],
+            input="2\n\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "MINIMAX_API_BASE=https://api.minimaxi.com/v1" in env_content
+
+
+def test_init_minimax_default_to_global_under_non_tty(tmp_path):
+    """Scripted (non-TTY) init falls back to the global endpoint silently."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"):
+        # CliRunner is non-TTY by default; region picker must NOT fire.
+        result = runner.invoke(
+            cli, ["init", "--model", "minimax/MiniMax-M2.7"],
+            input="\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "regional endpoints" not in result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "MINIMAX_API_BASE=https://api.minimax.io/v1" in env_content
+
+
+def test_init_minimax_base_url_flag_overrides_region_picker(tmp_path):
+    """An explicit --base-url bypasses the region picker entirely."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, [
+                "init",
+                "--model", "minimax/MiniMax-M2.7",
+                "--base-url", "https://my-proxy.example.com/v1",
+            ],
+            input="\n\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "regional endpoints" not in result.output  # picker skipped
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "MINIMAX_API_BASE=https://my-proxy.example.com/v1" in env_content
+        # Neither built-in endpoint should have leaked into the file.
+        assert "api.minimax.io" not in env_content
+        assert "api.minimaxi.com" not in env_content
+
+
+def test_init_minimax_invalid_choice_reprompts(tmp_path):
+    """An unrecognised region entry re-prompts instead of silently defaulting."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, ["init", "--model", "minimax/MiniMax-M2.7"],
+            input="99\n2\n\n\n",  # bad, then China, then api key, then lang
+        )
+        assert result.exit_code == 0, result.output
+        assert "Unknown choice '99'" in result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        # The second prompt answer (2 = China) wins.
+        assert "MINIMAX_API_BASE=https://api.minimaxi.com/v1" in env_content
+
+
+def test_init_minimax_key_and_url_written_together(tmp_path):
+    """Both LLM_API_KEY and MINIMAX_API_BASE land in .env when provided."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, ["init", "--model", "minimax/MiniMax-M2.7"],
+            input="1\nsk-minimax-key\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        from pathlib import Path
+        env_content = Path(".env").read_text()
+        assert "LLM_API_KEY=sk-minimax-key" in env_content
+        assert "MINIMAX_API_BASE=https://api.minimax.io/v1" in env_content
+
+
+def test_known_provider_keys_includes_minimax():
+    """``_KNOWN_PROVIDER_KEYS`` must list MINIMAX_API_KEY so that
+    ``_setup_llm_key`` propagates a generic LLM_API_KEY to it — otherwise
+    the Agents-SDK litellm provider wouldn't see the credential for
+    ``minimax/``-prefixed models.
+    """
+    from openkb.cli import _KNOWN_PROVIDER_KEYS
+    assert "MINIMAX_API_KEY" in _KNOWN_PROVIDER_KEYS
+
+
+def test_provider_to_base_env_includes_minimax():
+    """``_PROVIDER_TO_BASE_ENV`` must map ``minimax`` to its env var."""
+    from openkb.cli import _PROVIDER_TO_BASE_ENV
+    assert _PROVIDER_TO_BASE_ENV["minimax"] == "MINIMAX_API_BASE"
+
+
+def test_setup_llm_key_applies_minimax_base_url(tmp_path):
+    """``_setup_llm_key`` reads MINIMAX_API_BASE and sets litellm.api_base."""
+    from pathlib import Path
+
+    from openkb import cli as cli_mod
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("MINIMAX_API_BASE", "https://api.minimaxi.com/v1")
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    try:
+        kb_dir = tmp_path / "kb"
+        kb_dir.mkdir()
+        (kb_dir / ".openkb").mkdir()
+        (kb_dir / ".openkb/config.yaml").write_text(
+            "model: minimax/MiniMax-M2.7\n", encoding="utf-8",
+        )
+        cli_mod._setup_llm_key(kb_dir)
+        assert cli_mod.litellm.api_base == "https://api.minimaxi.com/v1"
+    finally:
+        monkeypatch.undo()
+
+
 class TestQueryStreamGate:
     """Regression tests for issue #34.
 

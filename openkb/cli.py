@@ -61,6 +61,7 @@ _KNOWN_PROVIDER_KEYS = (
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
     "DEEPSEEK_API_KEY", "MISTRAL_API_KEY", "MOONSHOT_API_KEY",
     "ZHIPUAI_API_KEY", "DASHSCOPE_API_KEY",
+    "MINIMAX_API_KEY",
 )
 
 # Providers that authenticate via OAuth device flow (subscription login
@@ -73,10 +74,20 @@ _OAUTH_PROVIDERS = {"chatgpt", "github_copilot"}
 # Anything outside this set (``ollama/``, ``vllm/``, ``openrouter/``,
 # ``custom/``, ...) is presumed self-hosted / proxied and triggers the
 # base-URL prompt.
+#
+# ``minimax`` is a special case: it ships two regional endpoints (global /
+# China). It lives here so the generic base-URL prompt doesn't fire, but
+# ``openkb init`` runs a dedicated region picker for it instead.
 _KNOWN_PUBLIC_PROVIDERS: frozenset[str] = frozenset({
     "openai", "anthropic", "gemini", "google", "deepseek", "mistral",
-    "moonshot", "zhipuai", "dashscope",
+    "moonshot", "zhipuai", "dashscope", "minimax",
 })
+
+# MiniMax regional endpoints. Both expose an OpenAI-compatible /v1 API
+# under the same ``minimax/`` LiteLLM provider prefix; the base URL is
+# the only differentiator. Defaults to global when no choice is made.
+_MINIMAX_GLOBAL_URL = "https://api.minimax.io/v1"
+_MINIMAX_CHINA_URL = "https://api.minimaxi.com/v1"
 
 # LiteLLM reads these per-provider env vars to override the base URL.
 # Used by ``openkb init`` to map a user-supplied base URL into the right
@@ -98,6 +109,7 @@ _PROVIDER_TO_BASE_ENV: dict[str, str] = {
     "openrouter": "OPENROUTER_API_BASE",
     "ollama": "OLLAMA_API_BASE",
     "vllm": "OPENAI_API_BASE",  # vLLM exposes an OpenAI-compatible endpoint
+    "minimax": "MINIMAX_API_BASE",
 }
 
 
@@ -612,6 +624,30 @@ def _base_url_option_callback(_ctx, _param, value):
     return _coerce_base_url(value)
 
 
+def _prompt_minimax_region() -> str:
+    """Prompt the user to pick a MiniMax regional endpoint.
+
+    MiniMax ships two endpoints under the same ``minimax/`` LiteLLM
+    provider prefix — global and China — and the only way to disambiguate
+    them is the base URL. Returns one of ``_MINIMAX_GLOBAL_URL`` or
+    ``_MINIMAX_CHINA_URL``. Accepts ``1``/``global`` (default) or
+    ``2``/``china``; anything else re-prompts so a typo never silently
+    routes the user to the wrong region.
+    """
+    click.echo("MiniMax has two regional endpoints:")
+    click.echo(f"  1. Global ({_MINIMAX_GLOBAL_URL})  [default]")
+    click.echo(f"  2. China  ({_MINIMAX_CHINA_URL})")
+    while True:
+        choice = click.prompt(
+            "Endpoint (1=Global, 2=China)", default="1", show_default=False,
+        ).strip().lower()
+        if choice in ("", "1", "global"):
+            return _MINIMAX_GLOBAL_URL
+        if choice in ("2", "china"):
+            return _MINIMAX_CHINA_URL
+        click.echo(f"Unknown choice {choice!r}; please enter 1 or 2.")
+
+
 def _stdin_is_tty() -> bool:
     """Return True when stdin is a real terminal.
 
@@ -664,6 +700,7 @@ def init(model, language, base_url):
     click.echo("  Anthropic: anthropic/claude-sonnet-4-6, anthropic/claude-opus-4-6")
     click.echo("  Gemini:    gemini/gemini-3.1-pro-preview, gemini/gemini-3-flash-preview")
     click.echo("  DeepSeek:  deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro")
+    click.echo("  MiniMax:  minimax/MiniMax-M2.7, minimax/MiniMax-M3")
     click.echo("  Others:    see https://docs.litellm.ai/docs/providers")
     click.echo()
     if model is None and _stdin_is_tty():
@@ -678,6 +715,15 @@ def init(model, language, base_url):
     # provider (i.e. it's self-hosted, proxied, or otherwise needs a
     # non-default endpoint). The --base-url flag overrides this gate.
     provider = _extract_provider(model)
+    # MiniMax is a known public provider but ships two regional endpoints
+    # under the same prefix — the only differentiator is the base URL, so
+    # we run a dedicated region picker instead of the generic prompt.
+    # Non-TTY (scripted init) falls back to global silently; users who
+    # need China there can pass --base-url explicitly.
+    if base_url is None and provider == "minimax" and _stdin_is_tty():
+        base_url = _coerce_base_url(_prompt_minimax_region())
+    elif base_url is None and provider == "minimax":
+        base_url = _MINIMAX_GLOBAL_URL
     if base_url is None and _stdin_is_tty() and provider not in _KNOWN_PUBLIC_PROVIDERS:
         base_url = _coerce_base_url(click.prompt(
             "API base URL (for self-hosted / proxied providers, enter to skip)",

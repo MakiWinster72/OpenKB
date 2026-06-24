@@ -314,7 +314,14 @@ def test_init_custom_provider_prompts_for_base_url(tmp_path):
         env_content = Path(".env").read_text()
         # ollama/ → OLLAMA_API_BASE per the provider map.
         assert "OLLAMA_API_BASE=http://localhost:11434" in env_content
-        assert "LLM_API_KEY" not in env_content  # user skipped the key
+        # User skipped the key — it must appear only as a COMMENTED
+        # placeholder, never as an active assignment.
+        assert "# LLM_API_KEY=" in env_content
+        for line in env_content.splitlines():
+            stripped = line.lstrip()
+            assert not stripped.startswith("LLM_API_KEY="), (
+                f"LLM_API_KEY must not be active when user skipped: {line!r}"
+            )
 
 
 def test_init_base_url_flag_writes_env(tmp_path):
@@ -369,8 +376,11 @@ def test_init_base_url_and_key_written_together(tmp_path):
         assert stat.S_IMODE(mode) == 0o600
 
 
-def test_init_base_url_blank_prompt_skips_write(tmp_path):
-    """Empty base URL answer ⇒ no *_API_BASE line in .env."""
+def test_init_base_url_blank_prompt_still_writes_env_with_comments(tmp_path):
+    """When the user provides nothing, .env is still created with
+    commented placeholders so the file exists as a discoverable target
+    for the user to drop their credentials into later.
+    """
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path), \
          patch("openkb.cli.register_kb"), \
@@ -382,8 +392,26 @@ def test_init_base_url_blank_prompt_skips_write(tmp_path):
         assert result.exit_code == 0, result.output
 
         from pathlib import Path
-        # No key + no URL ⇒ no .env file at all.
-        assert not Path(".env").exists()
+        env_path = Path(".env")
+        assert env_path.exists(), "init must always create .env"
+        content = env_path.read_text()
+
+        # No active assignments should leak in for fields the user skipped.
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            assert not stripped.startswith("LLM_API_KEY="), (
+                f"LLM_API_KEY must not be active when user skipped: {line!r}"
+            )
+            assert not stripped.startswith("OLLAMA_API_BASE="), (
+                f"OLLAMA_API_BASE must not be active when user skipped: {line!r}"
+            )
+        # Both placeholders appear as comments so the user knows what to set.
+        assert "# LLM_API_KEY=" in content
+        assert "# OLLAMA_API_BASE=" in content
+
+        # chmod 600 still applied even when content is mostly comments.
+        import stat
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
 
 def test_init_existing_env_preserved(tmp_path):
@@ -614,6 +642,54 @@ def test_provider_to_base_env_includes_minimax():
     """``_PROVIDER_TO_BASE_ENV`` must map ``minimax`` to its env var."""
     from openkb.cli import _PROVIDER_TO_BASE_ENV
     assert _PROVIDER_TO_BASE_ENV["minimax"] == "MINIMAX_API_BASE"
+
+
+def test_init_minimax_no_key_writes_env_with_placeholder(tmp_path):
+    """MiniMax region picked, but no key: .env still created with both
+    the active URL line and a commented LLM_API_KEY placeholder.
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), \
+         patch("openkb.cli.register_kb"), \
+         patch("openkb.cli._stdin_is_tty", return_value=True):
+        result = runner.invoke(
+            cli, ["init", "--model", "minimax/MiniMax-M2.7"],
+            input="2\n\n\n",  # region=china, blank key, blank language
+        )
+        assert result.exit_code == 0, result.output
+
+        from pathlib import Path
+        content = Path(".env").read_text()
+        assert "MINIMAX_API_BASE=https://api.minimaxi.com/v1" in content
+        # Key placeholder present as a comment, never as active assignment.
+        assert "# LLM_API_KEY=" in content
+        for line in content.splitlines():
+            assert not line.lstrip().startswith("LLM_API_KEY=")
+
+
+def test_build_env_content_no_provider_no_base_url():
+    """When no provider context is known, the env builder still emits
+    a valid LLM_API_KEY placeholder and no spurious *_API_BASE section.
+    """
+    from openkb.cli import _build_env_content
+    content = _build_env_content({}, provider=None)
+    assert "# LLM_API_KEY=" in content
+    # No provider ⇒ no base URL section at all (no misleading hint).
+    assert "_API_BASE=" not in content
+
+
+def test_build_env_content_active_key_and_placeholder_url():
+    from openkb.cli import _build_env_content
+    content = _build_env_content(
+        {"LLM_API_KEY": "sk-test"}, provider="anthropic",
+    )
+    # Active key written uncommented.
+    assert "LLM_API_KEY=sk-test" in content
+    # Base URL placeholder for anthropic is present but commented.
+    assert "# ANTHROPIC_API_BASE=" in content
+    # No active (uncommented) assignment leaks the placeholder URL.
+    for line in content.splitlines():
+        assert not line.lstrip().startswith("ANTHROPIC_API_BASE=")
 
 
 def test_setup_llm_key_applies_minimax_base_url(tmp_path):

@@ -36,6 +36,7 @@ from openkb.config import (
     resolve_entity_types,
 )
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
+from openkb.locks import atomic_write_text
 from openkb.schema import INDEX_SEED, get_agents_md
 
 logger = logging.getLogger(__name__)
@@ -262,10 +263,73 @@ def _cached_text(text: str) -> list[dict]:
     ephemeral cache_control marker.
 
     LiteLLM passes the marker through to Anthropic (and OpenRouter →
-    Anthropic). For providers that ignore cache_control, the list-of-blocks
-    payload remains a valid OpenAI-compatible content shape.
+    Anthropic). For other providers the marker is stripped at the request
+    egress (see :func:`_strip_cache_control`, applied in :func:`_llm_call`),
+    because not every provider merely *ignores* it — Gemini in particular
+    turns it into a 400. The list-of-blocks payload that remains is a valid
+    OpenAI-compatible content shape.
     """
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
+def _accepts_cache_control(model: str) -> bool:
+    """Whether ``model`` honours Anthropic-style ``cache_control`` markers.
+
+    The markers emitted by :func:`_cached_text` are an Anthropic feature.
+    LiteLLM forwards them to Anthropic directly, and to Anthropic (Claude)
+    models served via OpenRouter, Bedrock and Vertex. For other providers —
+    notably Gemini — LiteLLM instead translates the marker into a
+    provider-native cached-content object that conflicts with
+    ``system_instruction``/``tools`` and makes *every* request fail with
+    ``400 CachedContent can not be used with ...``. Detect the provider so the
+    marker can be dropped before it reaches such a backend.
+    """
+    # Import the real symbol rather than going through the module-level
+    # ``litellm`` reference: provider detection must stay correct even when a
+    # caller patches ``openkb.agent.compiler.litellm`` to stub out completion.
+    from litellm import get_llm_provider
+
+    try:
+        provider = get_llm_provider(model)[1]
+    except Exception:
+        provider = ""
+    lowered = model.lower()
+    if provider == "anthropic":
+        return True
+    if provider in ("openrouter", "bedrock", "vertex_ai") and (
+        "claude" in lowered or "anthropic" in lowered
+    ):
+        return True
+    return False
+
+
+def _strip_cache_control(messages: list[dict]) -> list[dict]:
+    """Return ``messages`` with every ``cache_control`` key removed.
+
+    Only list-of-blocks contents (see :func:`_cached_text`) can carry the
+    marker; plain-string contents pass through untouched. The input is not
+    mutated.
+    """
+    cleaned: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            blocks = [
+                {k: v for k, v in block.items() if k != "cache_control"}
+                if isinstance(block, dict)
+                else block
+                for block in content
+            ]
+            msg = {**msg, "content": blocks}
+        cleaned.append(msg)
+    return cleaned
+
+
+def _prepare_messages(model: str, messages: list[dict]) -> list[dict]:
+    """Drop cache_control markers when ``model`` would reject them."""
+    if _accepts_cache_control(model):
+        return messages
+    return _strip_cache_control(messages)
 
 
 class _Spinner:
@@ -328,6 +392,7 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
 
 def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
     """Single LLM call with animated progress and debug logging."""
+    messages = _prepare_messages(model, messages)
     extra_headers = get_extra_headers()
     if extra_headers:
         kwargs.setdefault("extra_headers", extra_headers)
@@ -353,6 +418,7 @@ def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str
 
 async def _llm_call_async(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
     """Async LLM call with timing output and debug logging."""
+    messages = _prepare_messages(model, messages)
     extra_headers = get_extra_headers()
     if extra_headers:
         kwargs.setdefault("extra_headers", extra_headers)
@@ -779,7 +845,7 @@ def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
     fm_lines.append(f"doc_type: {doc_type}")
     fm_lines.append(_yaml_kv_line("full_text", f"sources/{doc_name}.{ext}"))
     fm_block = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-    (summaries_dir / f"{doc_name}.md").write_text(fm_block + summary, encoding="utf-8")
+    atomic_write_text(summaries_dir / f"{doc_name}.md", fm_block + summary)
 
 
 _SAFE_NAME_RE = re.compile(r'[^\w\-]')
@@ -839,7 +905,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
             if brief:
                 fm_lines.append(_yaml_kv_line("description", brief))
             existing = frontmatter.block(fm_lines) + clean
-            path.write_text(existing, encoding="utf-8")
+            atomic_write_text(path, existing)
             return
         # Guarantee type + refresh description on update; remove legacy brief:.
         ex_parts2 = frontmatter.split(existing)
@@ -851,7 +917,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
             # Drop legacy brief: lines (migrated to description:).
             fm_block = frontmatter.drop_line(fm_block, "brief")
             existing = fm_block + body
-        path.write_text(existing, encoding="utf-8")
+        atomic_write_text(path, existing)
     else:
         clean_parts = frontmatter.split(content)
         if clean_parts is not None:
@@ -863,7 +929,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if brief:
             fm_lines.append(_yaml_kv_line("description", brief))
         fm_block = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-        path.write_text(fm_block + content, encoding="utf-8")
+        atomic_write_text(path, fm_block + content)
 
 
 def _write_entity(
@@ -927,10 +993,10 @@ def _write_entity(
                     break
             merged = [source_file] + [s for s in recovered if s != source_file]
             existing = _build_entity_frontmatter(merged) + clean
-        path.write_text(existing, encoding="utf-8")
+        atomic_write_text(path, existing)
         return
 
-    path.write_text(_build_entity_frontmatter([source_file]) + clean, encoding="utf-8")
+    atomic_write_text(path, _build_entity_frontmatter([source_file]) + clean)
 
 
 _set_fm_line = frontmatter.set_line
@@ -1041,7 +1107,7 @@ def _add_related_link(
         text = _prepend_source_to_frontmatter(text, source_file)
 
     text += f"\n\nSee also: {link}"
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
     return True
 
 
@@ -1068,7 +1134,7 @@ def _backlink_summary_pages(
     _ensure_h2_section(lines, section, quiet=True)
     for slug in reversed(missing):
         _insert_section_entry(lines, section, f"- [[{page_dir}/{slug}]]")
-    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(summary_path, "\n".join(lines))
 
 
 def _backlink_pages(
@@ -1089,7 +1155,7 @@ def _backlink_pages(
         lines = text.split("\n")
         _ensure_h2_section(lines, "## Related Documents", quiet=True)
         _insert_section_entry(lines, "## Related Documents", f"- {link}")
-        path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(path, "\n".join(lines))
 
 
 def _backlink_summary(wiki_dir: Path, doc_name: str, concept_slugs: list[str]) -> None:
@@ -1195,7 +1261,7 @@ def _remove_doc_from_pages(
             path.unlink()
             deleted.append(path.stem)
         elif new_text != text:
-            path.write_text(new_text, encoding="utf-8")
+            atomic_write_text(path, new_text)
             modified.append(path.stem)
 
     return {"modified": modified, "deleted": deleted}
@@ -1291,7 +1357,7 @@ def remove_doc_from_index(wiki_dir: Path, doc_name: str, concept_slugs_deleted: 
         while _remove_section_entry(lines, "## Entities", entity_link):
             pass
 
-    index_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(index_path, "\n".join(lines))
 
 
 def _update_index(
@@ -1315,7 +1381,7 @@ def _update_index(
 
     index_path = wiki_dir / "index.md"
     if not index_path.exists():
-        index_path.write_text(INDEX_SEED, encoding="utf-8")
+        atomic_write_text(index_path, INDEX_SEED)
 
     lines = index_path.read_text(encoding="utf-8").split("\n")
 
@@ -1361,7 +1427,7 @@ def _update_index(
         else:
             _insert_section_entry(lines, "## Entities", entry)
 
-    index_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(index_path, "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -2043,7 +2109,7 @@ async def compile_long_doc(
         updated = fm_block + body
         if updated != summary_content:
             summary_content = updated
-            summary_path.write_text(summary_content, encoding="utf-8")
+            atomic_write_text(summary_path, summary_content)
 
     # Base context A. cache_control marker on the doc message creates a
     # cache breakpoint covering (system + doc) for every concept call.

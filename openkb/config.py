@@ -14,7 +14,7 @@ from openkb.locks import atomic_write_text, flock, funlock
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.4-mini",
+    "model": "gpt-5.4",
     "language": "en",
     "pageindex_threshold": 20,
     "eval_concurrency": 8,
@@ -172,6 +172,34 @@ def resolve_timeout(config: dict) -> float | None:
         )
         return None
     return value
+
+
+def resolve_litellm_settings(config: dict) -> dict[str, Any]:
+    """Resolve the optional ``litellm:`` mapping of LiteLLM module settings.
+
+    Values are forwarded verbatim (the user owns them); only the container shape
+    is enforced — returns ``{}`` if absent or not a mapping, and drops non-string
+    keys. ``cli._apply_litellm_settings`` applies them.
+    """
+    raw = config.get("litellm")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(
+            "config: 'litellm' must be a mapping of LiteLLM settings, got %s — "
+            "ignoring it.",
+            type(raw).__name__,
+        )
+        return {}
+    settings: dict[str, Any] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            logger.warning(
+                "config: skipping 'litellm' entry with non-string key %r.", key
+            )
+            continue
+        settings[key] = value
+    return settings
 
 
 # Process-wide extra headers for LLM requests, resolved from the active KB's

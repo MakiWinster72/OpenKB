@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 
 from openkb import frontmatter
+from openkb.locks import atomic_write_text
 from openkb.schema import PAGE_CONTENT_DIRS
 
 # Matches [[wikilink]] or [[subdir/link]]
@@ -249,7 +250,7 @@ def fix_broken_links(
             text, known_targets, norm_index=norm_index,
         )
         if cleaned != text:
-            md.write_text(cleaned, encoding="utf-8")
+            atomic_write_text(md, cleaned)
             files_changed += 1
             ghosts_stripped += len(ghosts)
     return files_changed, ghosts_stripped
@@ -321,10 +322,14 @@ def find_orphans(wiki: Path) -> list[str]:
     incoming: set[str] = set()
     for links in outgoing.values():
         for lnk in links:
-            incoming.add(lnk.strip().strip("/"))
-        # Also add stems
-        for lnk in links:
-            incoming.add(Path(lnk.strip()).stem)
+            cleaned = lnk.strip().strip("/")
+            incoming.add(cleaned)
+            # Only treat a link as a bare-stem reference when it is itself a
+            # bare stem. A qualified link like ``concepts/foo`` must not mark a
+            # same-stem page in another directory (``summaries/foo``) as linked,
+            # which would hide a genuine orphan.
+            if "/" not in cleaned:
+                incoming.add(Path(cleaned).stem)
 
     orphans: list[str] = []
     for rel, links in outgoing.items():
